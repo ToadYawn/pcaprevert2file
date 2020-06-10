@@ -79,9 +79,9 @@ def getfileprefix(pkt):
     f"{socket.inet_ntoa(ip.dst)}"+","+\
     f"{tcp.sport}"+"="+f"{tcp.dport}"+","
 
-def getFirstWord(pkt):
+def getFirstWord(appmsg):
     try:
-        dataInLine = pkt[1][:15].decode(encoding='utf-8').splitlines(keepends=True)
+        dataInLine = appmsg[:15].decode(encoding='utf-8').splitlines(keepends=True)
         firstLine = dataInLine[0]
         # print(firstLine)
         firstWord = str(firstLine.split()[0])
@@ -101,28 +101,57 @@ def httpparser(tcp1v,folderpath):
     MIMEguesser = mimetypes.MimeTypes()
     MIMEguesser.add_type("application/x-javascript",".js") 
     fileprefix = getfileprefix(next(iter(tcp1v)))
-    for pkt in tcp1v:
-        firstword = getFirstWord(pkt)
-        if firstword:
-            print("Firstword",firstword)
-        reqrespSwitch = -1
 
+    tcp1vNextSeq = 0
+    lastack = 0
+    lastlen = 0
+    lastseq = 0
+
+    reqrespSwitch = -1
+    pktloop = 0
+    for pkt in tcp1v:
         buf = pkt[1]
         eth = dpkt.ethernet.Ethernet(buf)
         ip = eth.data
         tcp = ip.data
         http = tcp.data
+        # 用于排除差错tcp
+        ack = tcp.ack
+        syn = ( tcp.flags & dpkt.tcp.TH_SYN ) != 0
+        # fin = ( tcp.flags & dpkt.tcp.TH_FIN ) != 0
+        rst = ( tcp.flags & dpkt.tcp.TH_RST ) != 0
+        seq = tcp.seq
+        datalen = len(tcp.data)
+        if pktloop == 0:
+            lastack = ack
+            lastseq = seq
+            lastlen = datalen
+            tcp1vNextSeq = seq + syn
+            print("first tcp")
+            pktloop += 1
+            continue
+        pktloop += 1
+        if rst or seq!=tcp1vNextSeq or (ack==lastack and lastlen==datalen and lastseq==seq):
+            print("bad tcp")
+            continue
+        
+        tcp1vNextSeq = tcp1vNextSeq + syn + datalen
+        lastack = ack
+        lastlen = datalen
+        lastseq = seq
+
+
+        firstword = getFirstWord(http)
         # ftp smtp首单词响应码
         # pattern = re.compile(r'^[1-6]\d{2}')
         # result = pattern.findall(firstword)
         # isResponse = bool(result)
         if firstword in HTTPfirstline[:2]:
-            httpmessage['response'].append = http
-            print("here: ",http)
+            httpmessage['response'].append(http)
             reqrespSwitch = 0
             print("response")
         elif firstword in HTTPfirstline[2:7]:
-            httpmessage['request'].append = http
+            httpmessage['request'].append(http)
             reqrespSwitch = 1
             print("request")
         elif firstword in HTTPfirstline[7:]:
@@ -132,12 +161,14 @@ def httpparser(tcp1v,folderpath):
             if reqrespSwitch >= 0: 
                 httpmessage[list(httpmessage)[reqrespSwitch]][-1] += http
                 print("+ pkt ")
+    
     for msgnum,msg in enumerate(httpmessage['response']):
+        data = b''
         print("<<<Response")
         try:
             r = dpkt.http.Response(msg)
             data = r.body
-        except dpkt.dpkt.NeedData:
+        except (dpkt.dpkt.NeedData):#,dpkt.dpkt.UnpackError):
             print("主体数据不完整")
         
         if not data:
@@ -156,13 +187,15 @@ def httpparser(tcp1v,folderpath):
             filename = f'{fileprefix}{msgnum:002d}resp{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
+                print("writed!")
         
     for msgnum,msg in enumerate(httpmessage['request']):
+        data = b''
         print(">>>Request With Entity")
         try:
             r = dpkt.http.Request(msg)
             data = r.body
-        except dpkt.dpkt.NeedData:
+        except (dpkt.dpkt.NeedData,dpkt.dpkt.UnpackError):
             print("主体数据不完整")
         
         if not data:
@@ -181,6 +214,7 @@ def httpparser(tcp1v,folderpath):
             filename = f'{fileprefix}{msgnum:002d}req{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
+                print("writed!")
 class IPCONVERSATION:
     def __init__(self,pkt,ippair):
         self.ip = ippair
@@ -287,10 +321,10 @@ for ip,ipcon in ipcvstdict.items():
         if flags['syn']:
             newtcp1v = TCPONEWAY(pkt,porthere)
             tcp1vdict[porthere] = newtcp1v
-            print("created:",porthere)
+            print("created:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
         elif flags['fin']:
             if tcp1vhere:
-                print("find end:",porthere)
+                print("find end:",struct.unpack('>H',port[:2]),struct.unpack('>H',port[2:]))
                 if porthere[2:]==b'\x00\x50' or porthere[:2]==b'\x00\x50':
                     httpparser(tcp1vhere,folderpath)
                     
@@ -306,13 +340,12 @@ for ip,ipcon in ipcvstdict.items():
         else:
             newtcp1v = TCPONEWAY(pkt,porthere)
             tcp1vdict[porthere] = newtcp1v
-            print("created w/o syn:",porthere)
+            print("created w/o syn:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
 
-        # 未被fin确认的
+    # 未被fin确认的
     for port,tcp1v in tcp1vdict.items():
-        print("un finned")
+        print("un finned",struct.unpack('>H',port[:2]),struct.unpack('>H',port[2:]))
         if port[2:]==b'\x00\x50' or port[:2]==b'\x00\x50':
-            print("http ok")
             httpparser(tcp1v,folderpath)
 
 outputend = time.time()
