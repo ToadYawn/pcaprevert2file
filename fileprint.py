@@ -109,6 +109,8 @@ def httpparser(tcp1v,folderpath):
 
     reqrespSwitch = -1
     pktloop = 0
+    badtcpcnt = 0
+
     for pkt in tcp1v:
         buf = pkt[1]
         eth = dpkt.ethernet.Ethernet(buf)
@@ -126,13 +128,16 @@ def httpparser(tcp1v,folderpath):
             lastack = ack
             lastseq = seq
             lastlen = datalen
-            tcp1vNextSeq = seq + syn
-            print("first tcp")
+            tcp1vNextSeq = seq + syn + datalen
+            # print("first tcp")
             pktloop += 1
+            # print(f'ack: {ack}/lastack: {lastack}, tcp1vNextSeq:{tcp1vNextSeq}/seq: {seq}/lastseq: {lastseq}, datalen: {datalen}/lastlen: {lastlen} ')
             continue
+        # print(f'ack: {ack}/lastack: {lastack}, tcp1vNextSeq:{tcp1vNextSeq}/seq: {seq}/lastseq: {lastseq}, datalen: {datalen}/lastlen: {lastlen} ')
         pktloop += 1
         if rst or seq!=tcp1vNextSeq or (ack==lastack and lastlen==datalen and lastseq==seq):
-            print("bad tcp")
+            badtcpcnt += 1
+            print("bad")
             continue
         
         tcp1vNextSeq = tcp1vNextSeq + syn + datalen
@@ -149,27 +154,28 @@ def httpparser(tcp1v,folderpath):
         if firstword in HTTPfirstline[:2]:
             httpmessage['response'].append(http)
             reqrespSwitch = 0
-            print("response")
+            # print("response")
         elif firstword in HTTPfirstline[2:7]:
             httpmessage['request'].append(http)
             reqrespSwitch = 1
-            print("request")
+            # print("request")
         elif firstword in HTTPfirstline[7:]:
             reqrespSwitch = -1
-            print("skip")
+            # print("skip")
         else :
             if reqrespSwitch >= 0: 
                 httpmessage[list(httpmessage)[reqrespSwitch]][-1] += http
-                print("+ pkt ")
-    
+                # print("+ pkt ")
+    print("bad tcp: ", badtcpcnt)
     for msgnum,msg in enumerate(httpmessage['response']):
         data = b''
-        print("<<<Response")
+        # print("<<<Response")
         try:
             r = dpkt.http.Response(msg)
             data = r.body
         except (dpkt.dpkt.NeedData):#,dpkt.dpkt.UnpackError):
-            print("主体数据不完整")
+            pass
+            # print("主体数据不完整")
         
         if not data:
             continue
@@ -178,25 +184,26 @@ def httpparser(tcp1v,folderpath):
             isZip = getIsZip(r)
             if isZip:
                 content = zlib.decompress(data,wbits = zlib.MAX_WBITS | 16)
-                print("decompressed data：",content[:20])
+                # print("decompressed data：",content[:20])
                 data = content
-            else:
-                print("not compressed")
+            # else:
+                # print("not compressed")
             if not ext:
                 ext = '.bin'
             filename = f'{fileprefix}{msgnum:002d}resp{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
-                print("writed!")
+                # print("writed!")
         
     for msgnum,msg in enumerate(httpmessage['request']):
         data = b''
-        print(">>>Request With Entity")
+        # print(">>>Request With Entity")
         try:
             r = dpkt.http.Request(msg)
             data = r.body
-        except (dpkt.dpkt.NeedData,dpkt.dpkt.UnpackError):
-            print("主体数据不完整")
+        except (dpkt.dpkt.NeedData):#,dpkt.dpkt.UnpackError):
+            pass
+            # print("主体数据不完整")
         
         if not data:
             continue
@@ -205,16 +212,16 @@ def httpparser(tcp1v,folderpath):
             isZip= getIsZip(r)
             if isZip:
                 content = zlib.decompress(data,wbits = zlib.MAX_WBITS | 16)
-                print("decompressed data：",content[:20])
+                # print("decompressed data：",content[:20])
                 data = content
-            else:
-                print("not compressed")
+            # else:s
+                # print("not compressed")
             if not ext:
                 ext = '.bin'
             filename = f'{fileprefix}{msgnum:002d}req{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
-                print("writed!")
+                # print("writed!")
 class IPCONVERSATION:
     def __init__(self,pkt,ippair):
         self.ip = ippair
@@ -332,8 +339,8 @@ for ip,ipcon in ipcvstdict.items():
                     # smtp 还原文件
                     pass
                 del(tcp1vdict[porthere])
-            else:
-                print("extra fin")
+            # else:
+            #     print("extra fin")
         elif tcp1vhere:
             tcp1vhere.append(pkt)
         # 既没有syn过，字典中也不存在连接
