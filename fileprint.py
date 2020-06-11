@@ -7,7 +7,8 @@ import re
 import mimetypes
 import zlib
 import struct
-
+import email.parser
+import email.policy
 # SMTP首行命令元组 0 data之后才传输邮件首部和正文 1-2 信封 3-5 有文件 6- 无文件
 SMTPfirstline = ('DATA',
     'MAIL','RCPT',
@@ -109,8 +110,7 @@ def httpparser(tcp1v,folderpath):
 
     reqrespSwitch = -1
     pktloop = 0
-    badtcpcnt = 0
-
+    # badtcpcnt = 0
     for pkt in tcp1v:
         buf = pkt[1]
         eth = dpkt.ethernet.Ethernet(buf)
@@ -136,8 +136,8 @@ def httpparser(tcp1v,folderpath):
         # print(f'ack: {ack}/lastack: {lastack}, tcp1vNextSeq:{tcp1vNextSeq}/seq: {seq}/lastseq: {lastseq}, datalen: {datalen}/lastlen: {lastlen} ')
         pktloop += 1
         if rst or seq!=tcp1vNextSeq or (ack==lastack and lastlen==datalen and lastseq==seq):
-            badtcpcnt += 1
-            print("bad")
+            # badtcpcnt += 1
+            # print("bad")
             continue
         
         tcp1vNextSeq = tcp1vNextSeq + syn + datalen
@@ -166,7 +166,7 @@ def httpparser(tcp1v,folderpath):
             if reqrespSwitch >= 0: 
                 httpmessage[list(httpmessage)[reqrespSwitch]][-1] += http
                 # print("+ pkt ")
-    print("bad tcp: ", badtcpcnt)
+    # print("bad tcp: ", badtcpcnt)
     for msgnum,msg in enumerate(httpmessage['response']):
         data = b''
         # print("<<<Response")
@@ -190,11 +190,10 @@ def httpparser(tcp1v,folderpath):
                 # print("not compressed")
             if not ext:
                 ext = '.bin'
-            filename = f'{fileprefix}{msgnum:002d}resp{ext}'
+            filename = f'http{fileprefix}{msgnum:002d}resp{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
                 # print("writed!")
-        
     for msgnum,msg in enumerate(httpmessage['request']):
         data = b''
         # print(">>>Request With Entity")
@@ -218,10 +217,94 @@ def httpparser(tcp1v,folderpath):
                 # print("not compressed")
             if not ext:
                 ext = '.bin'
-            filename = f'{fileprefix}{msgnum:002d}req{ext}'
+            filename = f'http{fileprefix}{msgnum:002d}req{ext}'
             with open(os.path.join(folderpath,filename), 'wb') as f:
                 f.write(data)
                 # print("writed!")
+def smtpparser(tcp1v,folderpath):
+    fileprefix = getfileprefix(next(iter(tcp1v)))
+    smtpmessage = []
+    tcp1vNextSeq = 0
+    lastack = 0
+    lastlen = 0
+    lastseq = 0
+    pktloop = 0
+
+    dataflag = 0
+    for pkt in tcp1v:
+        buf = pkt[1]
+        eth = dpkt.ethernet.Ethernet(buf)
+        ip = eth.data
+        tcp = ip.data
+        smtp = tcp.data
+        # 用于排除差错tcp
+        ack = tcp.ack
+        syn = ( tcp.flags & dpkt.tcp.TH_SYN ) != 0
+        # fin = ( tcp.flags & dpkt.tcp.TH_FIN ) != 0
+        rst = ( tcp.flags & dpkt.tcp.TH_RST ) != 0
+        seq = tcp.seq
+        datalen = len(tcp.data)
+        if pktloop == 0:
+            lastack = ack
+            lastseq = seq
+            lastlen = datalen
+            tcp1vNextSeq = seq + syn + datalen
+            # print("first tcp")
+            pktloop += 1
+            # print(f'ack: {ack}/lastack: {lastack}, tcp1vNextSeq:{tcp1vNextSeq}/seq: {seq}/lastseq: {lastseq}, datalen: {datalen}/lastlen: {lastlen} ')
+            continue
+        # print(f'ack: {ack}/lastack: {lastack}, tcp1vNextSeq:{tcp1vNextSeq}/seq: {seq}/lastseq: {lastseq}, datalen: {datalen}/lastlen: {lastlen} ')
+        pktloop += 1
+        if rst or seq!=tcp1vNextSeq or (ack==lastack and lastlen==datalen and lastseq==seq):
+            # badtcpcnt += 1
+            # print("bad")
+            continue
+        
+        tcp1vNextSeq = tcp1vNextSeq + syn + datalen
+        lastack = ack
+        lastlen = datalen
+        lastseq = seq
+
+        firstword = getFirstWord(smtp)
+        # ftp smtp首单词响应码
+        pattern = re.compile(r'^[1-6]\d{2}')
+        result = pattern.findall(str(firstword))
+        isResponse = bool(result)
+
+        if firstword == SMTPfirstline[0]:
+            smtpmessage.append(b"")
+            dataflag = 1
+            # print(firstword)
+        elif firstword in SMTPfirstline[1:] or isResponse:
+            # print(f"response or not data: {firstword} ")
+            dataflag = 0
+            # pass
+        else :
+            if dataflag:
+                smtpmessage[-1] += smtp
+            #     print("+ pkt ")
+            # else:
+            #     print("- pkt")
+    # print("bad tcp: ", badtcpcnt)
+    MIMEguesser = mimetypes.MimeTypes()
+    for i,msg in enumerate(smtpmessage):
+        parsedMsg = email.parser.BytesParser(policy=email.policy.compat32).parsebytes(msg,headersonly=False)
+        # print(f"From: {parsedMsg['from']}")
+        # print(f"To: {parsedMsg['to']}")
+        count = 0
+        for part in parsedMsg.walk():
+            count += 1
+            ext = MIMEguesser.guess_extension(part.get_content_type())
+            filename = part.get_filename(failobj=None) # 'content-disposition'的'filename'不存在且'content-type'的'name'不存在时返回
+            if not filename:
+                if ext:
+                    filename = f'smtp{fileprefix}mail{i:02d}part{count:03d}{ext}'
+                else :
+                    continue
+            else:
+                filename = f'smtp{fileprefix}mail{i:02d}part{count:03d} {filename}'
+            with open(os.path.join(folderpath, filename), 'wb') as f:
+                f.write(part.get_payload(decode=True))
 class IPCONVERSATION:
     def __init__(self,pkt,ippair):
         self.ip = ippair
@@ -328,16 +411,15 @@ for ip,ipcon in ipcvstdict.items():
         if flags['syn']:
             newtcp1v = TCPONEWAY(pkt,porthere)
             tcp1vdict[porthere] = newtcp1v
-            print("created:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
+            # print("created:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
         elif flags['fin']:
             if tcp1vhere:
-                print("find end:",struct.unpack('>H',port[:2]),struct.unpack('>H',port[2:]))
+                print("find end:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
                 if porthere[2:]==b'\x00\x50' or porthere[:2]==b'\x00\x50':
                     httpparser(tcp1vhere,folderpath)
                     
                 if porthere[2:]==b'\x00\x19' or porthere[:2]==b'\x00\x19':
-                    # smtp 还原文件
-                    pass
+                    smtpparser(tcp1vhere,folderpath)
                 del(tcp1vdict[porthere])
             # else:
             #     print("extra fin")
@@ -347,13 +429,15 @@ for ip,ipcon in ipcvstdict.items():
         else:
             newtcp1v = TCPONEWAY(pkt,porthere)
             tcp1vdict[porthere] = newtcp1v
-            print("created w/o syn:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
+            # print("created w/o syn:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
 
     # 未被fin确认的
     for port,tcp1v in tcp1vdict.items():
-        print("un finned",struct.unpack('>H',port[:2]),struct.unpack('>H',port[2:]))
+        # print("un finned",struct.unpack('>H',port[:2]),struct.unpack('>H',port[2:]))
         if port[2:]==b'\x00\x50' or port[:2]==b'\x00\x50':
             httpparser(tcp1v,folderpath)
+        if port[2:]==b'\x00\x19' or port[:2]==b'\x00\x19':
+            smtpparser(tcp1vhere,folderpath)
 
 outputend = time.time()
 print(f"outputtime: {outputend - outputstart}")
