@@ -17,11 +17,11 @@ SMTPfirstline = ('DATA',
     'DSN','ETRN','PIPELINING','SIZE','STARTTLS','SMTPUTF8','UTF8SMTP','USER','PASS','REIN',
     'QUIT','DELE','REST','ABOR','CWD','CDUP','LIST','MKD','PWD','RMD','RNFR','RNTO','NLST',
     'SYST','STAT','ACCT','SMNT','MODE','STRU','ALLO','NOOP','HELP')
-# FTP首行命令元组 0-1 主被动模式 2 文件传输类型 A文本I二进制 3-5 必须在PORT/PASV之后在数据连接中传输而且传输的是文件 
+# FTP首行命令元组 0 主动模式 1-3 必须在PORT/PASV之后在数据连接中传输而且传输的是文件 4 被动模式 5 文件传输类型 A文本I二进制 
 # 6-8 必须在PORT/PASV之后在数据连接中传输但是传输的不是文件 9- 在控制连接中，无文件
 # 3 唯一数据从服务端发出且有文件 4-6 从服务端发出但无文件  
-FTPfirstline = ('PORT','PASV','TYPE',
-    'RETR','APPE','STOR',
+FTPfirstline = ('PORT','RETR','APPE','STOR',
+    'PASV','TYPE',
     'LIST','NLST','REST',
     'USER','PASS','REIN','QUIT','DELE','ABOR','CWD','CDUP','MKD','PWD','RMD','FEAT',
     'RNFR','RNTO','SYST','STAT','ACCT','SMNT','MODE','STRU','ALLO','NOOP','HELP')
@@ -52,6 +52,9 @@ def getportpair(packet):
     tcp = ip.data
     portpair = struct.pack('>H',tcp.sport) + struct.pack('>H',tcp.dport)
     return portpair
+def portpair2address(portpair):
+    return f"{struct.unpack('>H',portpair[:2])[0]}"+"="+\
+    f"{struct.unpack('>H',portpair[2:])[0]}"
 def getippair(packet):
     if not packet:
         return None
@@ -147,10 +150,6 @@ def httpparser(tcp1v,folderpath):
 
 
         firstword = getFirstWord(http)
-        # ftp smtp首单词响应码
-        # pattern = re.compile(r'^[1-6]\d{2}')
-        # result = pattern.findall(firstword)
-        # isResponse = bool(result)
         if firstword in HTTPfirstline[:2]:
             httpmessage['response'].append(http)
             reqrespSwitch = 0
@@ -173,14 +172,18 @@ def httpparser(tcp1v,folderpath):
         try:
             r = dpkt.http.Response(msg)
             data = r.body
-        except (dpkt.dpkt.NeedData):#,dpkt.dpkt.UnpackError):
-            pass
+        except (dpkt.dpkt.NeedData,dpkt.dpkt.UnpackError):
+            continue
             # print("主体数据不完整")
         
         if not data:
             continue
         else:
-            ext = MIMEguesser.guess_extension(r.headers['content-type'])
+            ext = b''
+            try:
+                ext = MIMEguesser.guess_extension(r.headers['content-type'][0])
+            except(KeyError):
+                continue
             isZip = getIsZip(r)
             if isZip:
                 content = zlib.decompress(data,wbits = zlib.MAX_WBITS | 16)
@@ -200,14 +203,14 @@ def httpparser(tcp1v,folderpath):
         try:
             r = dpkt.http.Request(msg)
             data = r.body
-        except (dpkt.dpkt.NeedData):#,dpkt.dpkt.UnpackError):
-            pass
+        except (dpkt.dpkt.NeedData,dpkt.dpkt.UnpackError):
+            continue
             # print("主体数据不完整")
         
         if not data:
             continue
         else:
-            ext = MIMEguesser.guess_extension(r.headers['content-type'])
+            ext = MIMEguesser.guess_extension(r.headers['content-type'][0])
             isZip= getIsZip(r)
             if isZip:
                 content = zlib.decompress(data,wbits = zlib.MAX_WBITS | 16)
@@ -305,6 +308,144 @@ def smtpparser(tcp1v,folderpath):
                 filename = f'smtp{fileprefix}mail{i:02d}part{count:03d} {filename}'
             with open(os.path.join(folderpath, filename), 'wb') as f:
                 f.write(part.get_payload(decode=True))
+def ftpparser(ftp2vdict,folderpath):
+    datalinkcount = -1
+    datalinkcport = []
+    datalinksport = []
+    datalinkfilename = {}
+    # 先在服务端发来的包中占位 sport 和 cport 数组
+    for port in ftp2vdict.keys():
+        if port[:2]==b'\x00\x15':
+            for pkt in ftp2vdict[port]:
+                buf = pkt[1]
+                eth = dpkt.ethernet.Ethernet(buf)
+                ip = eth.data
+                tcp = ip.data
+                ftp = tcp.data
+                if not ftp:
+                    continue
+                firstLineList = ftp.decode().splitlines()[0].split() 
+                # print(f"first list here: ",firstLineList)
+                firstword = firstLineList[0]
+                # 主动模式 数组占位
+                if firstword == '200' and firstLineList[1] == 'PORT':
+                    datalinkcport.append(b'')
+                    datalinksport.append(b'')
+                # 被动模式 获取服务端口
+                if firstword == '227':
+                    # ftpmsg.append(ftp)
+                    # datalinkcount += 1
+                    # 227 \357\277\275\357\277\275\357\277... (192,168,10,115,243,235) 切分
+                    pattern = re.compile(r'\((.*)\)')
+                    match = pattern.match(firstLineList[-1])
+                    addressWithoutParenthese = match.group(1)
+                    addresslist = addressWithoutParenthese.split(",")
+                    sport = int(addresslist[-2]) * 256 + int(addresslist[-1])
+                    datalinksport.append(struct.pack('>H',sport))
+                    datalinkcport.append(b'')
+                    # print("done")
+    # 从控制连接中得到数据连接端口和传输文件名
+    for port in ftp2vdict.keys():
+        clientpasvcport = 0
+        if port[2:]==b'\x00\x15':
+            for pkt in ftp2vdict[port]:
+                buf = pkt[1]
+                eth = dpkt.ethernet.Ethernet(buf)
+                ip = eth.data
+                tcp = ip.data
+                ftp = tcp.data
+                if not ftp:
+                    continue
+                firstLineList = ftp.decode().splitlines()[0].split() 
+                # print(f"first list here: ",firstLineList)
+                firstword = firstLineList[0]
+                
+                # 主动模式 获取服务端口(完整)
+                if firstword in FTPfirstline[0]:
+                    # PORT 192,168,233,128,213,1
+                    addresslist = firstLineList[1].split(",")
+                    clientportinbytes = struct.pack('>H',(int(addresslist[-2]) * 256 + int(addresslist[-1])))
+                    datalinkcount += 1
+                    datalinkcport[datalinkcount] = clientportinbytes
+                    datalinksport[datalinkcount] = b'\x00\x14'
+                    # print("done",datalinkcount)
+                # 被动模式 用于ftp2v一起加count 只有服务端口，客户端口累加(可惜不是按规律来)
+                elif firstword in FTPfirstline[4]:
+                    datalinkcount += 1
+                    if clientpasvcport == 0:
+                        clientpasvcport = struct.unpack('>H',port[:2])[0] + 1
+                        clientportinbytes = struct.pack('>H',clientpasvcport)
+                        datalinkcport[datalinkcount] = clientportinbytes
+                    else:
+                        clientpasvcport += 1
+                        clientportinbytes = struct.pack('>H',clientpasvcport)
+                        datalinkcport[datalinkcount] = clientportinbytes
+                    # print("done",datalinkcount)
+                # 指示包含数据的报文文件名，并和最后一个端口的数据连接对应
+                # RETR 文件从服务端发往客户端 s->c
+                elif firstword in FTPfirstline[1]:
+                    filename = firstLineList[1]
+                    errorpattern = re.compile(r'[\\/:\*\?"<>\|]+')
+                    result = re.findall(errorpattern,filename)
+                    combinedport = datalinksport[datalinkcount] + datalinkcport[datalinkcount]
+                    fileprefix = socket.inet_ntoa(ip.src) + "=" + socket.inet_ntoa(ip.dst)+","+portpair2address(combinedport)
+                    if result:
+                        filename = "errorfilename" + fileprefix + ".bin"
+                    datalinkfilename[combinedport] = "ftp" + fileprefix + filename
+                    # print("done data s->c here",combinedport)
+                # APPE STOR 文件从客户端发往服务端 c->s
+                elif firstword in FTPfirstline[2:4]:
+                    filename = firstLineList[1]
+                    errorpattern = re.compile(r'[\\/:\*\?"<>\|]+')
+                    result = re.findall(errorpattern,filename)
+                    combinedport = datalinkcport[datalinkcount] + datalinksport[datalinkcount]
+                    fileprefix = socket.inet_ntoa(ip.src) + "=" + socket.inet_ntoa(ip.dst)+","+portpair2address(combinedport)
+                    if result:
+                        filename = "errorfilename" + fileprefix + ".bin"
+                    datalinkfilename[combinedport] = "ftp" + fileprefix + filename
+                    # print("done c->s datahere",combinedport)
+                # LIST NLST REST 有数据非文件 从服务端发往客户端 s->c
+                elif firstword in FTPfirstline[6:9]:
+                    combinedport = datalinksport[datalinkcount] + datalinkcport[datalinkcount]
+                    fileprefix = socket.inet_ntoa(ip.src) + "=" + socket.inet_ntoa(ip.dst)+","+portpair2address(combinedport)
+                    filename = "ftp" + fileprefix + ".txt"
+                    datalinkfilename[combinedport] = filename
+                    # print("done listhere",combinedport)
+    
+    # print(datalinkcport)
+    # print(datalinksport)  
+    # print(datalinkfilename)
+    # 再到指定的数据连接中获取数据 由于被动模式客户端口不一定是每次+1，只匹配服务端口，keyport用于和控制连接中创建datalinkfilename字典对应
+    for port in ftp2vdict.keys():
+        # print(f"port:{port}")
+        
+        for i,sport in enumerate(datalinksport):
+            if sport == port[:2]:
+                keyport = datalinksport[i] + datalinkcport[i]
+            elif sport == port[2:]:
+                keyport = datalinkcport[i] + datalinksport[i]
+            else:
+                continue
+            if sport == b'\x00\x14' and keyport != port:
+                continue
+            ftpdata = b''
+            # print(f"yes: {port} keyport:{keyport}")
+            for pkt in ftp2vdict[port]:
+                buf = pkt[1]
+                eth = dpkt.ethernet.Ethernet(buf)
+                ip = eth.data
+                tcp = ip.data
+                ftpdata += tcp.data
+            # print(ftpdata[:30])
+            if not len(ftpdata):
+                # print("Null ftpdata")
+                continue
+            else:
+                # print(f"filename: {datalinkfilename[keyport]}")
+                with open(os.path.join(folderpath, datalinkfilename[keyport]), 'wb') as f:
+                    f.write(ftpdata)
+                    # print(f"done {datalinkfilename[keyport]}")
+
 class IPCONVERSATION:
     def __init__(self,pkt,ippair):
         self.ip = ippair
@@ -319,6 +460,9 @@ class IPCONVERSATION:
             except IndexError:
                 break
             index += 1
+    def __len__(self):
+        return len(self._iterable)
+    
 class TCPONEWAY:
     def __init__(self,pkt,portpair):
         self.port = portpair
@@ -333,11 +477,13 @@ class TCPONEWAY:
             except IndexError:
                 break
             index += 1
+    def __len__(self):
+        return len(self._iterable)
 # # 输入文件名及文件夹
 pcapfilename = sys.argv[1]
 pcapfilenamewo = os.path.split(pcapfilename)[-1]
 pcapfolder = pcapfilenamewo.split(".")[0]
-print("pcapfolder: ",pcapfolder)
+# print("pcapfolder: ",pcapfolder)
 
 start = time.time() # 排序计时
 
@@ -362,7 +508,7 @@ while pkt:
     pkt = next(reader,None)
     pktNum += 1
     # print(f"packet number: {pktNum}")
-print(len(ipcvstdict))
+print(f"ip conversations: {len(ipcvstdict)}")
 
 end = time.time() # 排序计时
 print(f"order time: {end - start}")
@@ -393,8 +539,8 @@ for ip,ipcon in ipcvstdict.items():
         porthere = getportpair(pkt)
         flags = getFlags(pkt)
         tcp1vhere = tcp1vdict.get(porthere,None)
-
-        if porthere[4:]==b'\x00\x15' and flags['syn']:
+            
+        if porthere[2:]==b'\x00\x15' and flags['syn']:
             ftpflag = 1
             newftp2v = TCPONEWAY(pkt,porthere)
             ftp2vdict[porthere] = newftp2v
@@ -403,10 +549,14 @@ for ip,ipcon in ipcvstdict.items():
             ftp2vhere = ftp2vdict.get(porthere,None)
             if porthere[2:]==b'\x00\x15' and flags['fin']:
                 ftpflag = 0
-                # 解析ftp......
+                ftpparser(ftp2vdict,folderpath)
                 ftp2vdict.clear()
             elif ftp2vhere:
                 ftp2vhere.append(pkt)
+            else:
+                newftp2v = TCPONEWAY(pkt,porthere)
+                ftp2vdict[porthere] = newftp2v
+                
         
         if flags['syn']:
             newtcp1v = TCPONEWAY(pkt,porthere)
@@ -414,7 +564,7 @@ for ip,ipcon in ipcvstdict.items():
             # print("created:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
         elif flags['fin']:
             if tcp1vhere:
-                print("find end:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
+                # print("find end:",struct.unpack('>H',porthere[:2]),struct.unpack('>H',porthere[2:]))
                 if porthere[2:]==b'\x00\x50' or porthere[:2]==b'\x00\x50':
                     httpparser(tcp1vhere,folderpath)
                     
@@ -437,7 +587,7 @@ for ip,ipcon in ipcvstdict.items():
         if port[2:]==b'\x00\x50' or port[:2]==b'\x00\x50':
             httpparser(tcp1v,folderpath)
         if port[2:]==b'\x00\x19' or port[:2]==b'\x00\x19':
-            smtpparser(tcp1vhere,folderpath)
+            smtpparser(tcp1v,folderpath)
 
 outputend = time.time()
 print(f"outputtime: {outputend - outputstart}")
